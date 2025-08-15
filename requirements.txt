@@ -1,4 +1,6 @@
-Flask
-openai
-python-dotenv
-gunicorn
+flask==3.0.3
+requests==2.32.3
+python-dotenv==1.0.1
+tavily-python==0.5.0  # Untuk TavilyClient
+langdetect==1.0.9
+flask-caching==2.3.0
