@@ -18,7 +18,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(24))
+app.secret_key = secrets.token_hex(24)
 app.permanent_session_lifetime = timedelta(hours=2)
 
 limiter = Limiter(
