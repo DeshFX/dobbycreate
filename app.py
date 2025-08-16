@@ -18,13 +18,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-SECRET_KEY_FILE = 'secret.key'
-if os.path.exists(SECRET_KEY_FILE):
-    with open(SECRET_KEY_FILE, 'r') as f:
-        app.secret_key = f.read().strip()
-else:
-    app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(24))
-
+app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(24))
 app.permanent_session_lifetime = timedelta(hours=2)
 
 limiter = Limiter(
@@ -379,4 +373,6 @@ def rate_limit_exceeded(error):
     return jsonify({"error": "Rate limit exceeded. Please slow down."}), 429
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+else:
+    application = app
