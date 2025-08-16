@@ -39,8 +39,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 cache = Cache(app, config={
     'CACHE_TYPE': 'SimpleCache',
-    'CACHE_DEFAULT_TIMEOUT': 300,
-    'CACHE_THRESHOLD': 100
+    'CACHE_DEFAULT_TIMEOUT': 600,
+    'CACHE_THRESHOLD': 200
 })
 
 session_lock = threading.Lock()
@@ -79,22 +79,26 @@ def research_topic(topic):
     try:
         search_queries = [
             f"cryptocurrency {topic} technical analysis whitepaper official documentation",
-            f"{topic} crypto project tokenomics use cases roadmap 2024",
-            f"{topic} blockchain technology partnerships market analysis"
+            f"{topic} crypto project tokenomics use cases roadmap 2024"
         ]
         
         all_context = []
-        for query in search_queries[:2]:
+        
+        for query in search_queries[:1]:
             try:
                 response = tavily_client.search(
                     query=query, 
-                    search_depth="advanced", 
-                    max_results=3,
+                    search_depth="basic",
+                    max_results=2,
                     include_domains=["coindesk.com", "cointelegraph.com", "decrypt.co", "theblock.co"]
                 )
                 for res in response.get('results', []):
                     if len(res['content']) > 100:
-                        all_context.append(f"- {res['content'][:500]}... (Source: {res['url']})")
+                        all_context.append(f"- {res['content'][:300]}... (Source: {res['url']})")
+                        
+                if len(all_context) >= 2:
+                    break
+                    
             except Exception as e:
                 app.logger.warning(f"Search query failed: {e}")
                 continue
@@ -104,7 +108,7 @@ def research_topic(topic):
         app.logger.error(f"Tavily search error: {e}")
         return "Failed to fetch information due to search service error."
 
-@cache.cached(timeout=300, key_prefix='trending_crypto')
+@cache.cached(timeout=600, key_prefix='trending_crypto')
 @monitor_performance
 def get_trending_crypto():
     try:
@@ -169,7 +173,7 @@ def get_crypto_price(topic):
         app.logger.error(f"CoinGecko price error: {e}")
         return "Price not available"
 
-@cache.cached(timeout=600, key_prefix='crypto_list')
+@cache.cached(timeout=1200, key_prefix='crypto_list')
 @monitor_performance
 def get_crypto_list():
     try:
@@ -353,6 +357,14 @@ def home():
     if "chat_history" not in session:
         session["chat_history"] = []
     return render_template("chat.html")
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
+
+@app.route("/favicon.png")
+def favicon_png():
+    return "", 204
 
 @app.route("/chat", methods=["POST"])
 @limiter.limit("15 per minute")
