@@ -1,6 +1,7 @@
-flask==3.0.3
-requests==2.32.3
-python-dotenv==1.0.1
-tavily-python==0.5.0  # Untuk TavilyClient
-langdetect==1.0.9
-flask-caching==2.3.0
+Flask==2.3.3
+Flask-Caching==2.1.0
+Flask-Limiter==3.5.0
+python-dotenv==1.0.0
+requests==2.31.0
+tavily-python==0.3.3
+regex==2023.8.8
