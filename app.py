@@ -182,7 +182,7 @@ def call_dobby(system_prompt, user_message, temperature=0.8, is_pro_mode=False, 
         "n": num_outputs
     }
     try:
-        r = requests.post(FIREWORKS_URL, headers=headers, json=payload, timeout=30)
+        r = requests.post(FIREWORKS_URL, headers=headers, json=payload, timeout=8)
         r.raise_for_status()
         data = r.json()
         if not data.get("choices"):
