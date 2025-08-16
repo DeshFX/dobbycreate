@@ -1,5 +1,4 @@
 {
-  "version": 2,
   "builds": [
     {
       "src": "app.py",
@@ -9,7 +8,12 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "/app.py"
+      "dest": "app.py"
     }
-  ]
+  ],
+  "functions": {
+    "app.py": {
+      "runtime": "python3.11"
+    }
+  }
 }
