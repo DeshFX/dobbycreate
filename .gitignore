@@ -1,11 +1,4 @@
 .env
-venv/
 __pycache__/
-secret.key
-logs/
-cache/
-*.db
-*.sqlite
-*.sqlite3
+*.pyc
 .DS_Store
-.vercel
