@@ -21,10 +21,11 @@ app.secret_key = secrets.token_hex(24)
 app.permanent_session_lifetime = timedelta(hours=2)
 
 limiter = Limiter(
-    app,
     key_func=get_remote_address,
     default_limits=["200 per hour", "30 per minute"]
 )
+limiter.init_app(app)
+
 
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 DOBBY_MODEL = "accounts/sentientfoundation/models/dobby-unhinged-llama-3-3-70b-new"
