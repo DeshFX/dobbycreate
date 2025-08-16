@@ -26,13 +26,14 @@ limiter = Limiter(
 )
 limiter.init_app(app)
 
-
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 DOBBY_MODEL = "accounts/sentientfoundation/models/dobby-unhinged-llama-3-3-70b-new"
 FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
+
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -43,6 +44,22 @@ cache = Cache(app, config={
 })
 
 session_lock = threading.Lock()
+
+def filter_profanity(text):
+    profane_words = {
+        "bastard", "dick", "pussy", "scoundrel", "dog", "fuck",
+        "fucking", "shit", "bitch", "cunt", "asshole", "damn",
+        "hell", "piss", "bullshit", "motherfucker", "cocksucker"
+    }
+    words = text.split()
+    filtered_words = []
+    for word in words:
+        clean_word = re.sub(r'[^\w]', '', word.lower())
+        if clean_word not in profane_words:
+            filtered_words.append(word)
+        else:
+            filtered_words.append('*' * len(word))
+    return " ".join(filtered_words)
 
 def monitor_performance(func):
     @functools.wraps(func)
@@ -55,28 +72,34 @@ def monitor_performance(func):
         return result
     return wrapper
 
-def filter_profanity(text):
-    profane_words = {
-        "bastard", "dick", "pussy", "scoundrel", "dog", "fuck",
-        "fucking", "shit", "bitch", "cunt", "asshole"
-    }
-    words = text.split()
-    filtered_words = []
-    for word in words:
-        clean_word = re.sub(r'[^\w]', '', word.lower())
-        if clean_word not in profane_words:
-            filtered_words.append(word)
-    return " ".join(filtered_words)
-
 @monitor_performance
 def research_topic(topic):
     if not tavily_client:
         return "Search is disabled as TAVILY_API_KEY is not set."
     try:
-        search_query = f"in-depth technical details, use cases, and tokenomics of crypto project '{topic}'"
-        response = tavily_client.search(query=search_query, search_depth="advanced", max_results=5)
-        context = "\n".join([f"- {res['content']} (Source: {res['url']})" for res in response.get('results', [])])
-        return context if context else "No relevant search results found."
+        search_queries = [
+            f"cryptocurrency {topic} technical analysis whitepaper official documentation",
+            f"{topic} crypto project tokenomics use cases roadmap 2024",
+            f"{topic} blockchain technology partnerships market analysis"
+        ]
+        
+        all_context = []
+        for query in search_queries[:2]:
+            try:
+                response = tavily_client.search(
+                    query=query, 
+                    search_depth="advanced", 
+                    max_results=3,
+                    include_domains=["coindesk.com", "cointelegraph.com", "decrypt.co", "theblock.co"]
+                )
+                for res in response.get('results', []):
+                    if len(res['content']) > 100:
+                        all_context.append(f"- {res['content'][:500]}... (Source: {res['url']})")
+            except Exception as e:
+                app.logger.warning(f"Search query failed: {e}")
+                continue
+        
+        return "\n".join(all_context) if all_context else "No relevant search results found."
     except Exception as e:
         app.logger.error(f"Tavily search error: {e}")
         return "Failed to fetch information due to search service error."
@@ -85,33 +108,107 @@ def research_topic(topic):
 @monitor_performance
 def get_trending_crypto():
     try:
+        headers = {"Accept": "application/json"}
+        if COINGECKO_API_KEY:
+            headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+            
         r = requests.get(
             "https://api.coingecko.com/api/v3/search/trending",
             timeout=10,
-            headers={"Accept": "application/json"}
+            headers=headers
         )
         r.raise_for_status()
         data = r.json()
-        names = [c["item"]["name"] for c in data.get("coins", [])][:7]
-        return ", ".join(names) if names else "None"
+        
+        trending_data = []
+        for coin in data.get("coins", [])[:5]:
+            item = coin["item"]
+            trending_data.append({
+                "name": item["name"],
+                "symbol": item["symbol"],
+                "market_cap_rank": item.get("market_cap_rank", "N/A")
+            })
+        
+        return trending_data if trending_data else []
     except Exception as e:
-        app.logger.error(f"CoinGecko error: {e}")
-        return "Could not fetch trending data"
+        app.logger.error(f"CoinGecko trending error: {e}")
+        return []
 
 def get_crypto_price(topic):
     topic_id = re.sub(r'[^a-zA-Z0-9\-]', '', topic.lower().replace(" ", "-"))
     try:
+        headers = {"Accept": "application/json"}
+        if COINGECKO_API_KEY:
+            headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+            
         r = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/price?ids={topic_id}&vs_currencies=usd",
+            f"https://api.coingecko.com/api/v3/simple/price?ids={topic_id}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true",
             timeout=6,
-            headers={"Accept": "application/json"}
+            headers=headers
         )
         r.raise_for_status()
         data = r.json()
-        price = data.get(topic_id, {}).get("usd")
-        return f"Current price: ${price}" if price else "Price not available"
-    except Exception:
+        
+        if topic_id in data:
+            price_data = data[topic_id]
+            price = price_data.get("usd")
+            change_24h = price_data.get("usd_24h_change")
+            market_cap = price_data.get("usd_market_cap")
+            
+            result = f"Current price: ${price}"
+            if change_24h is not None:
+                change_symbol = "+" if change_24h > 0 else ""
+                result += f" ({change_symbol}{change_24h:.2f}%)"
+            if market_cap:
+                result += f", Market Cap: ${market_cap:,.0f}"
+            
+            return result
+        else:
+            return "Price not available"
+    except Exception as e:
+        app.logger.error(f"CoinGecko price error: {e}")
         return "Price not available"
+
+@cache.cached(timeout=600, key_prefix='crypto_list')
+@monitor_performance
+def get_crypto_list():
+    try:
+        headers = {"Accept": "application/json"}
+        if COINGECKO_API_KEY:
+            headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+            
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/list",
+            timeout=15,
+            headers=headers
+        )
+        r.raise_for_status()
+        data = r.json()
+        
+        crypto_dict = {}
+        for coin in data[:1000]:
+            crypto_dict[coin["id"]] = {
+                "name": coin["name"],
+                "symbol": coin["symbol"].upper()
+            }
+        
+        return crypto_dict
+    except Exception as e:
+        app.logger.error(f"CoinGecko list error: {e}")
+        return {}
+
+def find_crypto_id(topic):
+    crypto_list = get_crypto_list()
+    topic_lower = topic.lower()
+    
+    for crypto_id, info in crypto_list.items():
+        if (topic_lower == info["name"].lower() or 
+            topic_lower == info["symbol"].lower() or 
+            topic_lower == crypto_id.lower()):
+            return crypto_id
+    
+    topic_id = re.sub(r'[^a-zA-Z0-9\-]', '', topic_lower.replace(" ", "-"))
+    return topic_id
 
 def calculate_tweet_length(text):
     url_pattern = re.compile(r'https?://[^\s]+')
@@ -133,58 +230,112 @@ def truncate_for_twitter(text):
             right = mid - 1
     return text[:left].rstrip() + "..."
 
-def build_system_prompt(style, is_pro_mode, with_hashtags):
-    lines = [
-        "You are Dobby, a sharp, witty, and crypto-native copywriter.",
-        "Focus strictly on the user's main topic.",
-        "Keep names, tickers, and facts consistent.",
-        "Do not fabricate news or data.",
-        "Output language: English only."
-    ]
+def build_system_prompt(style, is_pro_mode, with_hashtags, topic):
+    base_prompt = """You are Dobby, a professional crypto analyst and copywriter with deep expertise in blockchain technology, DeFi, and cryptocurrency markets.
+
+CORE PRINCIPLES:
+- Always provide accurate, fact-based information
+- Never fabricate or speculate on unverified data
+- Maintain a professional yet engaging tone
+- Focus strictly on the specified topic
+- Use proper grammar, spelling, and formatting
+- Be concise but informative
+
+WRITING GUIDELINES:
+- Start with the most important information first
+- Use clear, accessible language that both beginners and experts can understand
+- Include specific details when available (prices, percentages, dates)
+- Avoid unnecessary jargon unless explaining technical concepts
+- Structure information logically with smooth transitions"""
+
     if is_pro_mode:
-        lines.append("Pro mode: generate a comprehensive detailed answer.")
+        base_prompt += "\n\nMODE: Professional Analysis - Provide comprehensive, detailed analysis with:"
+        base_prompt += "\n• Technical fundamentals and use cases"
+        base_prompt += "\n• Market position and competitive analysis"
+        base_prompt += "\n• Risk factors and opportunities"
+        base_prompt += "\n• Clear structure with introduction, analysis, and conclusion"
+        base_prompt += "\n• Target length: 500-1000 words"
     else:
-        lines.append("Standard mode: concise tweet under 280 characters.")
-    if style == "meme":
-        lines.append("Style: witty meme humor.")
-    elif style == "education":
-        lines.append("Style: educational breakdown.")
-    elif style == "engagement":
-        lines.append("Style: open-ended question for discussion.")
-    elif style == "news":
-        lines.append("Style: news summary.")
+        base_prompt += "\n\nMODE: Social Media - Create engaging tweet content:"
+        base_prompt += "\n• Maximum 280 characters including hashtags"
+        base_prompt += "\n• Hook readers with compelling opening"
+        base_prompt += "\n• Include key facts or insights"
+        base_prompt += "\n• Use emojis sparingly but effectively"
+
+    style_instructions = {
+        "meme": "\n\nSTYLE: Witty & Memorable - Use clever wordplay, crypto culture references, and humor while maintaining accuracy. Make it shareable and relatable to the crypto community.",
+        "education": "\n\nSTYLE: Educational & Clear - Break down complex concepts into digestible information. Use analogies when helpful. Focus on teaching and informing the audience.",
+        "engagement": "\n\nSTYLE: Discussion-Driven - Pose thought-provoking questions or controversial (but factual) statements that encourage replies and discussions. Create conversation starters.",
+        "news": "\n\nSTYLE: News & Updates - Present information in a journalistic style. Lead with the most newsworthy angle. Include context and implications of the information."
+    }
+    
+    base_prompt += style_instructions.get(style, style_instructions["education"])
+
     if with_hashtags:
-        lines.append("Include 1-2 relevant hashtags.")
+        base_prompt += "\n\nHASHTAGS: Include 1-3 relevant, popular hashtags that align with the content and crypto community standards."
     else:
-        lines.append("Do not include hashtags.")
-    return "\n".join(lines)
+        base_prompt += "\n\nHASHTAGS: Do not include any hashtags in the response."
+
+    base_prompt += f"\n\nTOPIC FOCUS: All content must directly relate to '{topic}' and provide value to readers interested in this specific cryptocurrency/blockchain project."
+    base_prompt += "\n\nOUTPUT LANGUAGE: English only. Ensure perfect grammar and professional presentation."
+
+    return base_prompt
 
 @monitor_performance
-def call_dobby(system_prompt, user_message, temperature=0.8, is_pro_mode=False, num_outputs=1, chat_history=None):
-    max_tokens = 3000 if is_pro_mode else 290
+def call_dobby(system_prompt, user_message, temperature=0.7, is_pro_mode=False, num_outputs=1, chat_history=None):
+    max_tokens = 4000 if is_pro_mode else 400
+    temperature = min(temperature, 0.9)
+    
     headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
     messages = [{"role": "system", "content": system_prompt}]
+    
     if chat_history:
-        messages.extend(chat_history)
+        messages.extend(chat_history[-4:])
+    
     messages.append({"role": "user", "content": user_message})
+    
     payload = {
         "model": DOBBY_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": float(temperature),
-        "n": num_outputs
+        "top_p": 0.95,
+        "frequency_penalty": 0.1,
+        "presence_penalty": 0.1,
+        "n": min(num_outputs, 3)
     }
+    
     try:
-        r = requests.post(FIREWORKS_URL, headers=headers, json=payload, timeout=8)
+        r = requests.post(FIREWORKS_URL, headers=headers, json=payload, timeout=15)
         r.raise_for_status()
         data = r.json()
+        
         if not data.get("choices"):
             return ["No response available."]
-        replies = [c["message"]["content"].strip() for c in data["choices"]]
-        return [truncate_for_twitter(r) if not is_pro_mode else r for r in replies]
+        
+        replies = []
+        for choice in data["choices"]:
+            content = choice["message"]["content"].strip()
+            
+            if content:
+                content = re.sub(r'\n{3,}', '\n\n', content)
+                content = re.sub(r' {2,}', ' ', content)
+                
+                if content and not is_pro_mode:
+                    sentences = content.split('. ')
+                    sentences = [s.strip().capitalize() if s else s for s in sentences]
+                    content = '. '.join(sentences)
+                
+                if not is_pro_mode:
+                    content = truncate_for_twitter(content)
+                
+                replies.append(content)
+        
+        return replies if replies else ["AI service returned empty response."]
+        
     except Exception as e:
-        app.logger.error(f"Fireworks error: {e}")
-        return ["AI service unavailable."]
+        app.logger.error(f"Fireworks API error: {e}")
+        return ["AI service temporarily unavailable. Please try again."]
 
 def update_chat_history(user_msg, bot_reply):
     with session_lock:
@@ -208,39 +359,81 @@ def home():
 def chat():
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
+    
     data = request.get_json()
+    
     if not FIREWORKS_API_KEY:
         return jsonify({"error": "FIREWORKS_API_KEY not set"}), 500
+    
     topic = (data.get("message") or "").strip()
     if not topic:
         return jsonify({"error": "Message cannot be empty"}), 400
-    style = data.get("style", "meme")
+    
+    if len(topic) > 200:
+        return jsonify({"error": "Topic too long. Please limit to 200 characters."}), 400
+    
+    style = data.get("style", "education")
     is_pro_mode = bool(data.get("proMode", False))
-    with_hashtags = bool(data.get("hashtags", False))
+    with_hashtags = bool(data.get("hashtags", True))
+    
     try:
-        temperature = float(data.get("temperature", 0.8))
-        temperature = max(0.1, min(2.0, temperature))
+        temperature = float(data.get("temperature", 0.7))
+        temperature = max(0.1, min(1.5, temperature))
     except:
-        temperature = 0.8
+        temperature = 0.7
+    
     num_outputs = int(data.get("numOutputs", 1)) if "numOutputs" in data else 1
+    num_outputs = min(num_outputs, 3)
+    
     trending = get_trending_crypto()
-    research_context = ""
-    price_info = get_crypto_price(topic)
-    if style in ["education", "news"] or (style == "engagement" and is_pro_mode):
-        research_context = research_topic(topic)
+    crypto_id = find_crypto_id(topic)
+    price_info = get_crypto_price(crypto_id)
+    
+    research_context = research_topic(topic)
+    
     chat_history = session.get("chat_history", [])
-    system_prompt = build_system_prompt(style, is_pro_mode, with_hashtags)
-    user_message = (
-        f"Topic: {topic}\n"
-        f"Style: {style}\n"
-        f"Context:\n{research_context}\n\n"
-        f"Extra: {price_info}\nTrending: {trending}\n"
-    )
+    system_prompt = build_system_prompt(style, is_pro_mode, with_hashtags, topic)
+    
+    trending_text = ""
+    if trending:
+        trending_names = [t["name"] for t in trending[:3]]
+        trending_text = f"Currently trending: {', '.join(trending_names)}"
+    
+    user_message = f"""TOPIC: {topic}
+
+CURRENT MARKET DATA:
+{price_info}
+{trending_text}
+
+RESEARCH CONTEXT:
+{research_context}
+
+STYLE REQUESTED: {style}
+PRO MODE: {'Yes' if is_pro_mode else 'No'}
+
+Please create content about {topic} following the guidelines above."""
+    
     replies = call_dobby(system_prompt, user_message, temperature, is_pro_mode, num_outputs, chat_history)
+    
     replies = [filter_profanity(r) for r in replies]
-    if replies:
-        update_chat_history(topic, replies[0])
-    return jsonify({"replies": replies, "trending": trending, "ts": int(time.time())})
+    
+    quality_replies = []
+    for reply in replies:
+        if len(reply.strip()) > 10 and not reply.lower().startswith("i'm sorry") and "unavailable" not in reply.lower():
+            quality_replies.append(reply)
+    
+    if not quality_replies:
+        quality_replies = ["Unable to generate quality content. Please try rephrasing your topic or adjusting parameters."]
+    
+    if quality_replies:
+        update_chat_history(topic, quality_replies[0])
+    
+    return jsonify({
+        "replies": quality_replies, 
+        "trending": trending,
+        "priceInfo": price_info,
+        "ts": int(time.time())
+    })
 
 @app.route("/health")
 def health():
@@ -252,7 +445,11 @@ def not_found(e):
 
 @app.errorhandler(429)
 def rate_limit(e):
-    return jsonify({"error": "Rate limit exceeded"}), 429
+    return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
