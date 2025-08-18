@@ -73,7 +73,7 @@ def get_twitter_sentiment(topic):
         query = f'"{topic}" lang:en -is:retweet'
         response = tweepy_client.search_recent_tweets(
             query=query,
-            max_results=5,
+            max_results=10,
             tweet_fields=["text"]
         )
         if not response.data:
