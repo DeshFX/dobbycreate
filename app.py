@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from tavily import TavilyClient
 import logging
 from flask_caching import Cache
+import tweepy
 
 load_dotenv()
 
@@ -35,6 +36,13 @@ tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+try:
+    tweepy_client = tweepy.Client(TWITTER_BEARER_TOKEN) if TWITTER_BEARER_TOKEN else None
+except Exception as e:
+    app.logger.error(f"Failed to initialize Tweepy client: {e}")
+    tweepy_client = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 cache = Cache(app, config={
@@ -55,6 +63,29 @@ def monitor_performance(func):
             app.logger.info(f"{func.__name__} completed in {duration:.2f}s")
         return result
     return wrapper
+
+@cache.cached(timeout=300, key_prefix='twitter_sentiment')
+@monitor_performance
+def get_twitter_sentiment(topic):
+    if not tweepy_client:
+        return "Twitter search is disabled as TWITTER_BEARER_TOKEN is not set."
+    try:
+        query = f'"{topic}" lang:en -is:retweet'
+        response = tweepy_client.search_recent_tweets(
+            query=query,
+            max_results=5,
+            tweet_fields=["text"]
+        )
+        if not response.data:
+            return "No recent tweets found on this topic."
+        tweets_text = []
+        for tweet in response.data:
+            cleaned_text = tweet.text.replace('\n', ' ').strip()
+            tweets_text.append(f"- {cleaned_text}")
+        return "\n".join(tweets_text)
+    except Exception as e:
+        app.logger.error(f"Twitter API error: {e}")
+        return "Failed to fetch information from Twitter due to an API error."
 
 @monitor_performance
 def research_topic(topic):
@@ -260,33 +291,45 @@ def chat():
     data = request.get_json()
     if not FIREWORKS_API_KEY:
         return jsonify({"error": "FIREWORKS_API_KEY not set"}), 500
+    
     topic = (data.get("message") or "").strip()
     if not topic:
         return jsonify({"error": "Message cannot be empty"}), 400
     if len(topic) > 200:
         return jsonify({"error": "Topic too long. Please limit to 200 characters."}), 400
+        
     style = data.get("style", "education")
     is_pro_mode = bool(data.get("proMode", False))
     with_hashtags = bool(data.get("hashtags", True))
+    
     try:
         temperature = float(data.get("temperature", 0.7))
         temperature = max(0.1, min(1.5, temperature))
     except:
         temperature = 0.7
+        
     num_outputs = int(data.get("numOutputs", 1)) if "numOutputs" in data else 1
     num_outputs = min(num_outputs, 3)
+
     trending = get_trending_crypto()
     research_context = research_topic(topic)
+    twitter_context = get_twitter_sentiment(topic)
     chat_history = session.get("chat_history", [])
+    
     system_prompt = build_system_prompt(style, is_pro_mode, with_hashtags, topic)
+    
     trending_text = ""
     if trending:
         trending_names = [t["name"] for t in trending[:3]]
         trending_text = f"Currently trending: {', '.join(trending_names)}"
+
     user_message = f"""TOPIC: {topic}
 
 TRENDING CRYPTO:
 {trending_text}
+
+RECENT TWITTER SENTIMENT:
+{twitter_context}
 
 RESEARCH CONTEXT:
 {research_context}
@@ -295,15 +338,20 @@ STYLE REQUESTED: {style}
 PRO MODE: {'Yes' if is_pro_mode else 'No'}
 
 Please create content about {topic} following the guidelines above."""
+    
     replies = call_dobby(system_prompt, user_message, temperature, is_pro_mode, num_outputs, chat_history)
+    
     quality_replies = []
     for reply in replies:
         if len(reply.strip()) > 10 and not reply.lower().startswith("i'm sorry") and "unavailable" not in reply.lower():
             quality_replies.append(reply)
+            
     if not quality_replies:
         quality_replies = ["Unable to generate quality content. Please try rephrasing your topic or adjusting parameters."]
+    
     if quality_replies:
         update_chat_history(topic, quality_replies[0])
+
     return jsonify({
         "replies": quality_replies,
         "trending": trending,
