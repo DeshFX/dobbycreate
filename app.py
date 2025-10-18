@@ -18,7 +18,7 @@ import tweepy
 load_dotenv()
 
 app = Flask(__name__, template_folder="templates", static_folder=None)
-app.secret_key = secrets.token_hex(24)
+app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(24))
 app.permanent_session_lifetime = timedelta(hours=2)
 
 limiter = Limiter(
@@ -27,6 +27,7 @@ limiter = Limiter(
 )
 limiter.init_app(app)
 
+# API Configuration
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 DOBBY_MODEL = "accounts/sentientfoundation/models/dobby-unhinged-llama-3-3-70b-new"
 FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
@@ -40,10 +41,13 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 try:
     tweepy_client = tweepy.Client(TWITTER_BEARER_TOKEN) if TWITTER_BEARER_TOKEN else None
 except Exception as e:
-    app.logger.error(f"Failed to initialize Tweepy client: {e}")
+    app.logger.error(f"Tweepy initialization failed: {e}")
     tweepy_client = None
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 cache = Cache(app, config={
     'CACHE_TYPE': 'SimpleCache',
@@ -57,18 +61,22 @@ def monitor_performance(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()
-        result = func(*args, **kwargs)
-        duration = time.time() - start_time
-        if duration > 5:
-            app.logger.info(f"{func.__name__} completed in {duration:.2f}s")
-        return result
+        try:
+            result = func(*args, **kwargs)
+            duration = time.time() - start_time
+            if duration > 5:
+                app.logger.info(f"{func.__name__} completed in {duration:.2f}s")
+            return result
+        except Exception as e:
+            app.logger.error(f"{func.__name__} error: {str(e)}")
+            raise
     return wrapper
 
 @cache.cached(timeout=300, key_prefix='twitter_sentiment')
 @monitor_performance
 def get_twitter_sentiment(topic):
     if not tweepy_client:
-        return "Twitter search is disabled as TWITTER_BEARER_TOKEN is not set."
+        return "Twitter integration disabled (TWITTER_BEARER_TOKEN not set)."
     try:
         query = f'"{topic}" lang:en -is:retweet'
         response = tweepy_client.search_recent_tweets(
@@ -77,45 +85,51 @@ def get_twitter_sentiment(topic):
             tweet_fields=["text"]
         )
         if not response.data:
-            return "No recent tweets found on this topic."
-        tweets_text = []
-        for tweet in response.data:
-            cleaned_text = tweet.text.replace('\n', ' ').strip()
-            tweets_text.append(f"- {cleaned_text}")
-        return "\n".join(tweets_text)
+            return "No recent tweets found."
+        
+        tweets_text = [
+            tweet.text.replace('\n', ' ').strip()
+            for tweet in response.data
+        ]
+        return "\n".join(f"- {t}" for t in tweets_text)
     except Exception as e:
         app.logger.error(f"Twitter API error: {e}")
-        return "Failed to fetch information from Twitter due to an API error."
+        return "Failed to fetch Twitter data."
 
 @monitor_performance
 def research_topic(topic):
     if not tavily_client:
-        return "Search is disabled as TAVILY_API_KEY is not set."
+        return "Search disabled (TAVILY_API_KEY not set)."
     try:
         search_queries = [
-            f"{topic} cryptocurrency project tokenomics roadmap whitepaper official documentation",
-            f"{topic} crypto analysis use cases community updates"
+            f"{topic} cryptocurrency project tokenomics roadmap whitepaper",
+            f"{topic} crypto analysis use cases community"
         ]
+        
         all_context = []
-        for query in search_queries[:1]:
+        for query in search_queries:
             try:
                 response = tavily_client.search(
-                    query=query, 
+                    query=query,
                     search_depth="advanced",
                     max_results=5
                 )
+                
                 for res in response.get('results', []):
-                    if len(res['content']) > 100:
-                        all_context.append(f"- {res['content'][:300]}... (Source: {res['url']})")
-                if len(all_context) >= 2:
+                    if len(res.get('content', '')) > 100:
+                        snippet = res['content'][:250]
+                        all_context.append(f"{snippet}... (Source: {res['url']})")
+                
+                if len(all_context) >= 3:
                     break
             except Exception as e:
                 app.logger.warning(f"Search query failed: {e}")
                 continue
-        return "\n".join(all_context) if all_context else "No relevant search results found."
+        
+        return "\n".join(all_context) if all_context else "No research results found."
     except Exception as e:
-        app.logger.error(f"Tavily search error: {e}")
-        return "Failed to fetch information due to search service error."
+        app.logger.error(f"Tavily error: {e}")
+        return "Research service unavailable."
 
 @cache.cached(timeout=600, key_prefix='trending_crypto')
 @monitor_performance
@@ -124,6 +138,7 @@ def get_trending_crypto():
         headers = {"Accept": "application/json"}
         if COINGECKO_API_KEY:
             headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
+        
         r = requests.get(
             "https://api.coingecko.com/api/v3/search/trending",
             timeout=10,
@@ -131,6 +146,7 @@ def get_trending_crypto():
         )
         r.raise_for_status()
         data = r.json()
+        
         trending_data = []
         for coin in data.get("coins", [])[:5]:
             item = coin["item"]
@@ -139,9 +155,9 @@ def get_trending_crypto():
                 "symbol": item["symbol"],
                 "market_cap_rank": item.get("market_cap_rank", "N/A")
             })
-        return trending_data if trending_data else []
+        return trending_data
     except Exception as e:
-        app.logger.error(f"CoinGecko trending error: {e}")
+        app.logger.error(f"CoinGecko error: {e}")
         return []
 
 def calculate_tweet_length(text):
@@ -165,53 +181,99 @@ def truncate_for_twitter(text):
     return text[:left].rstrip() + "..."
 
 def build_system_prompt(style, is_pro_mode, with_hashtags, topic):
-    base_prompt = """You are Dobby, a professional content creator with deep expertise in crafting engaging, accurate, and impactful posts for X (Twitter).
+    base_prompt = """You are Dobby, a professional AI content creator specializing in cryptocurrency analysis and insights.
 
 CORE PRINCIPLES:
-- Always provide accurate, fact-based information
+- Provide accurate, fact-based information only
 - Never fabricate or speculate on unverified data
-- Maintain a professional yet engaging tone
-- Focus strictly on the specified topic
-- Use proper grammar, spelling, and formatting
+- Maintain professional yet engaging tone
+- Structure content clearly with proper paragraphs
+- Use natural language flow, avoid AI clichés
 - Be concise but informative
 
 WRITING GUIDELINES:
-- Start with the most important information first
-- Use clear, accessible language that both beginners and experts can understand
-- Include specific details when available
-- Avoid unnecessary jargon unless explaining technical concepts
-- Structure information logically with smooth transitions"""
+- Start with the most important information
+- Use clear, accessible language for all knowledge levels
+- Include specific details and metrics when available
+- Avoid unnecessary jargon; explain technical concepts clearly
+- Write in proper paragraphs with smooth transitions
+- Minimize use of dashes and fragments
+- Keep formatting consistent and scannable"""
 
     if is_pro_mode:
-        base_prompt += "\n\nMODE: Professional Analysis - Provide comprehensive, detailed analysis with:"
-        base_prompt += "\n• Fundamentals and use cases"
-        base_prompt += "\n• Position and competitive analysis"
-        base_prompt += "\n• Risk factors and opportunities"
-        base_prompt += "\n• Clear structure with introduction, analysis, and conclusion"
-        base_prompt += "\n• Target length: 500-1000 words"
+        base_prompt += """
+
+CONTENT MODE: Professional Analysis (500-1000 words)
+Structure your response as follows:
+
+1. INTRODUCTION (1-2 paragraphs)
+Overview of the topic with key context and significance.
+
+2. FUNDAMENTALS (2-3 paragraphs)
+Core features, technology, and infrastructure. Include:
+- Technical architecture
+- Key differentiators
+- Ecosystem positioning
+
+3. USE CASES & VALUE PROPOSITION (2-3 paragraphs)
+Practical applications and why it matters. Discuss:
+- Primary use cases
+- Target audience
+- Real-world benefits
+
+4. COMPETITIVE ANALYSIS (1-2 paragraphs)
+How it compares to alternatives:
+- Key competitors
+- Competitive advantages
+- Market positioning
+
+5. RISK FACTORS & OPPORTUNITIES (1-2 paragraphs)
+Balanced perspective including:
+- Potential risks
+- Growth opportunities
+- Timeline considerations
+
+6. CONCLUSION (1-2 paragraphs)
+Summary and investment perspective."""
     else:
-        base_prompt += "\n\nMODE: Social Media - Create engaging tweet content:"
-        base_prompt += "\n• Maximum 280 characters including hashtags"
-        base_prompt += "\n• Hook readers with compelling opening"
-        base_prompt += "\n• Include key facts or insights"
-        base_prompt += "\n• Use emojis sparingly but effectively"
+        base_prompt += """
+
+CONTENT MODE: Social Media Tweet (Max 280 characters)
+- Hook readers immediately with compelling opening
+- Include key insight or fact
+- Use emojis sparingly (1-2 maximum)
+- Create engagement or curiosity"""
 
     style_instructions = {
-        "meme": "\n\nSTYLE: Witty & Memorable - Use clever wordplay, culture references, and humor while maintaining accuracy.",
-        "education": "\n\nSTYLE: Educational & Clear - Break down complex concepts into digestible information.",
-        "engagement": "\n\nSTYLE: Discussion-Driven - Pose thought-provoking questions or controversial statements that encourage replies.",
-        "news": "\n\nSTYLE: News & Updates - Present information in a journalistic style with context and implications."
+        "meme": "\n\nSTYLE: Entertaining & Witty\n- Use clever wordplay and cultural references\n- Keep tone playful and memorable\n- Maintain accuracy while being fun\n- NO profanity or harsh language",
+        
+        "education": "\n\nSTYLE: Clear & Educational\n- Break down complex concepts simply\n- Use examples and comparisons\n- Professional, informative tone\n- Focus on learning value",
+        
+        "engagement": "\n\nSTYLE: Conversational & Discussion-Driven\n- Pose thought-provoking questions\n- Encourage community participation\n- Natural, friendly tone\n- Drive engagement without hype",
+        
+        "news": "\n\nSTYLE: Journalistic & Factual\n- Present information objectively\n- Include relevant context and implications\n- Neutral, professional language\n- Focus on news value and impact"
     }
     
     base_prompt += style_instructions.get(style, style_instructions["education"])
 
     if with_hashtags:
-        base_prompt += "\n\nHASHTAGS: Include 1-3 relevant, popular hashtags that align with the content and community standards."
+        base_prompt += "\n\nHASHTAGS: Include 1-3 relevant, popular hashtags aligned with the content."
     else:
-        base_prompt += "\n\nHASHTAGS: Do not include any hashtags in the response."
+        base_prompt += "\n\nHASHTAGS: Do not include hashtags."
 
-    base_prompt += f"\n\nTOPIC FOCUS: All content must directly relate to '{topic}' and provide value to readers interested in this specific subject."
-    base_prompt += "\n\nOUTPUT LANGUAGE: English only. Ensure perfect grammar and professional presentation."
+    base_prompt += f"""
+
+FORMATTING RULES:
+- Use proper paragraphs (not bullet points unless absolutely necessary)
+- Only use bullet points for concise lists (3-5 items max)
+- Each bullet point should be ONE SHORT LINE
+- Avoid overused phrases: "flipping the script", "epic", "boss", "crew"
+- Write naturally, as a human expert would
+
+TOPIC FOCUS: '{topic}'
+All content must directly relate to this topic and provide genuine value to the reader.
+
+OUTPUT: English only. Professional presentation with perfect grammar."""
 
     return base_prompt
 
@@ -219,11 +281,17 @@ WRITING GUIDELINES:
 def call_dobby(system_prompt, user_message, temperature=0.7, is_pro_mode=False, num_outputs=1, chat_history=None):
     max_tokens = 4000 if is_pro_mode else 400
     temperature = min(temperature, 0.9)
-    headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
+    
+    headers = {
+        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
     messages = [{"role": "system", "content": system_prompt}]
     if chat_history:
         messages.extend(chat_history[-4:])
     messages.append({"role": "user", "content": user_message})
+    
     payload = {
         "model": DOBBY_MODEL,
         "messages": messages,
@@ -234,29 +302,39 @@ def call_dobby(system_prompt, user_message, temperature=0.7, is_pro_mode=False, 
         "presence_penalty": 0.1,
         "n": min(num_outputs, 3)
     }
+    
     try:
         r = requests.post(FIREWORKS_URL, headers=headers, json=payload, timeout=15)
         r.raise_for_status()
         data = r.json()
+        
         if not data.get("choices"):
             return ["No response available."]
+        
         replies = []
         for choice in data["choices"]:
             content = choice["message"]["content"].strip()
             if content:
+                # Clean up excessive whitespace
                 content = re.sub(r'\n{3,}', '\n\n', content)
                 content = re.sub(r' {2,}', ' ', content)
-                if content and not is_pro_mode:
-                    sentences = content.split('. ')
-                    sentences = [s.strip().capitalize() if s else s for s in sentences]
-                    content = '. '.join(sentences)
+                
+                # Apply truncation for non-pro mode
                 if not is_pro_mode:
                     content = truncate_for_twitter(content)
+                
                 replies.append(content)
+        
         return replies if replies else ["AI service returned empty response."]
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        app.logger.error("Fireworks API timeout")
+        return ["Request timeout. Please try again."]
+    except requests.exceptions.RequestException as e:
         app.logger.error(f"Fireworks API error: {e}")
-        return ["AI service temporarily unavailable. Please try again."]
+        return ["AI service error. Please try again."]
+    except Exception as e:
+        app.logger.error(f"Unexpected error: {e}")
+        return ["An unexpected error occurred."]
 
 def update_chat_history(user_msg, bot_reply):
     with session_lock:
@@ -288,67 +366,82 @@ def favicon_png():
 def chat():
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
+    
     data = request.get_json()
+    
     if not FIREWORKS_API_KEY:
-        return jsonify({"error": "FIREWORKS_API_KEY not set"}), 500
+        return jsonify({"error": "FIREWORKS_API_KEY not configured"}), 500
     
     topic = (data.get("message") or "").strip()
     if not topic:
         return jsonify({"error": "Message cannot be empty"}), 400
     if len(topic) > 200:
-        return jsonify({"error": "Topic too long. Please limit to 200 characters."}), 400
-        
+        return jsonify({"error": "Topic too long (max 200 characters)"}), 400
+    
+    # Validate and parse parameters
     style = data.get("style", "education")
+    if style not in ["meme", "education", "engagement", "news"]:
+        style = "education"
+    
     is_pro_mode = bool(data.get("proMode", False))
     with_hashtags = bool(data.get("hashtags", True))
     
     try:
         temperature = float(data.get("temperature", 0.7))
         temperature = max(0.1, min(1.5, temperature))
-    except:
+    except (ValueError, TypeError):
         temperature = 0.7
-        
-    num_outputs = int(data.get("numOutputs", 1)) if "numOutputs" in data else 1
-    num_outputs = min(num_outputs, 3)
+    
+    try:
+        num_outputs = int(data.get("numOutputs", 1))
+        num_outputs = max(1, min(num_outputs, 3))
+    except (ValueError, TypeError):
+        num_outputs = 1
 
+    # Gather context data
     trending = get_trending_crypto()
     research_context = research_topic(topic)
     twitter_context = get_twitter_sentiment(topic)
     chat_history = session.get("chat_history", [])
     
+    # Build system prompt
     system_prompt = build_system_prompt(style, is_pro_mode, with_hashtags, topic)
     
+    # Prepare trending text
     trending_text = ""
     if trending:
-        trending_names = [t["name"] for t in trending[:3]]
-        trending_text = f"Currently trending: {', '.join(trending_names)}"
-
-    user_message = f"""TOPIC: {topic}
-
-TRENDING CRYPTO:
-{trending_text}
-
-RECENT TWITTER SENTIMENT:
-{twitter_context}
-
-RESEARCH CONTEXT:
-{research_context}
-
-STYLE REQUESTED: {style}
-PRO MODE: {'Yes' if is_pro_mode else 'No'}
-
-Please create content about {topic} following the guidelines above."""
+        trending_names = ", ".join([f"{t['name']} ({t['symbol'].upper()})" for t in trending[:3]])
+        trending_text = f"Currently trending: {trending_names}"
     
+    # Build user message
+    user_message = f"""Analyze and create content about: {topic}
+
+CONTEXT DATA:
+Trending: {trending_text}
+Twitter Sentiment: {twitter_context}
+Research: {research_context}
+
+Style: {style}
+Pro Mode: {'Yes' if is_pro_mode else 'No'}
+Include Hashtags: {'Yes' if with_hashtags else 'No'}
+
+Please create high-quality, professional content following all guidelines."""
+    
+    # Generate responses
     replies = call_dobby(system_prompt, user_message, temperature, is_pro_mode, num_outputs, chat_history)
     
-    quality_replies = []
-    for reply in replies:
-        if len(reply.strip()) > 10 and not reply.lower().startswith("i'm sorry") and "unavailable" not in reply.lower():
-            quality_replies.append(reply)
-            
-    if not quality_replies:
-        quality_replies = ["Unable to generate quality content. Please try rephrasing your topic or adjusting parameters."]
+    # Filter low-quality responses
+    quality_replies = [
+        reply for reply in replies
+        if len(reply.strip()) > 10 and
+        not reply.lower().startswith("i'm sorry") and
+        "unavailable" not in reply.lower()
+    ]
     
+    if not quality_replies:
+        quality_replies = ["Unable to generate quality content. Please try adjusting your topic or parameters."]
+    
+    # Update history
     if quality_replies:
         update_chat_history(topic, quality_replies[0])
 
@@ -360,15 +453,19 @@ Please create content about {topic} following the guidelines above."""
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "ts": int(time.time())})
+    return jsonify({"status": "ok", "timestamp": int(time.time())}), 200
+
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": "Bad request"}), 400
 
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({"error": "Not found"}), 404
 
 @app.errorhandler(429)
-def rate_limit(e):
-    return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
+def rate_limit_exceeded(e):
+    return jsonify({"error": "Rate limit exceeded. Try again later."}), 429
 
 @app.errorhandler(500)
 def internal_error(e):
